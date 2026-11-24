@@ -46,7 +46,7 @@ This server uses the classic API, so it works on any on-premises PRTG from 22.1 
 | `prtg_get_device` | One device, every sensor that is not up (with its message), and the names of those that are. |
 | `prtg_list_sensors` | Sensors by state (`down`, `down_partial`, `down_acknowledged`, `warning`, `unusual`, `paused`, `up`, `unknown`), name or parent. |
 | `prtg_list_alarms` | Down and partially down sensors, plus acknowledged, warning and unusual ones (each can be turned off), worst first across every page (one table read per state, so paging is exact), with how long they have been down, and the whole-server counts. |
-| `prtg_get_sensor` | One sensor's details (`getsensordetails.json`) and every channel's last value. |
+| `prtg_get_sensor` | One sensor's details (`getsensordetails.json`) and every channel's last value; a traffic channel gives its speed (`lastValue`) and its volume (`volume`). PRTG's `lastvalue_` column repeats the same JSON key for the two, so that one response is read with a parser that keeps repeated keys. |
 | `prtg_get_sensor_history` | Historic data over `hours` back from now or `start`/`end` (server local time), at most 31 days. Per-channel min, max, mean and last over every interval, plus up to `max_rows` (default 100, max 500) evenly spaced intervals. The average is picked so the range is about 300 intervals unless `average_seconds` is given (raw values only for 24 hours or less). |
 | `prtg_list_logs` | Log entries, newest first, for `today`, `yesterday`, `7days`, `30days`, `6months` or `12months`, for the whole server or one object and below. |
 | `prtg_search` | Groups and sensors whose name contains the text, devices whose name or host contains it. |

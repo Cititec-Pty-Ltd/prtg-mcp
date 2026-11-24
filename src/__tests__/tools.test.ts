@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ConfigError, buildUrl, parsePrtgJson, parsePrtgUrl, parseTimeZone, scrub, setFetchForTests } from '../client.js';
+import { ConfigError, Repeated, buildUrl, parseJsonKeepingRepeats, parsePrtgJson, parsePrtgUrl, parseTimeZone, scrub, setFetchForTests } from '../client.js';
 import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
 import { chooseAverage, parseLocal, prtgTime, resolveRange, rowValues, sample } from '../tools/history.js';
 import { clean, wrapUntrusted } from '../tools/shared.js';
@@ -338,6 +338,38 @@ describe('details', () => {
     const d = dataOf(await call('prtg_get_sensor', { sensor_id: 2001 }));
     expect(d).toMatchObject({ id: 2001, name: 'Ping', type: 'ping', deviceId: 3001, state: 'up', message: 'OK' });
     expect(d.channels).toEqual([{ id: 0, name: 'Ping Time', lastValue: '4 msec', lastValueRaw: 4 }]);
+  });
+  it('prtg_get_sensor gives traffic channels both speed and volume from the repeated lastvalue keys', async () => {
+    // PRTG's real shape for columns=objid,name,lastvalue_: the keys repeat (volume, then speed).
+    const raw =
+      '{"prtg-version":"25.1.104.1961","treesize":3,"channels":[' +
+      '{"objid":-4,"objid_raw":-4,"name":"Traffic In","lastvalue":"1,234 MByte","lastvalue_raw":1293942784.0000,"lastvalue":"12,345 kbit/s","lastvalue_raw":1543125.0000},' +
+      '{"objid":-1,"objid_raw":-1,"name":"Traffic Total","lastvalue":"98 %","lastvalue_raw":98.0000,"lastvalue":"2,468 MByte","lastvalue_raw":2587885568.0000},' +
+      '{"objid":0,"objid_raw":0,"name":"Downtime","lastvalue":"","lastvalue_raw":""}]}';
+    const { fn, calls } = fakePrtg({
+      'getsensordetails.json': json({ sensordata: { name: 'Traffic WAN', sensortype: 'snmptraffic', statusid: '3' } }),
+      'table.json:channels': new Response(raw, { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    });
+    setFetchForTests(fn);
+    const d = dataOf(await call('prtg_get_sensor', { sensor_id: 2002 }));
+    expect(calls.find((u) => u.searchParams.get('content') === 'channels')!.searchParams.get('columns')).toBe('objid,name,lastvalue_');
+    expect(d.channels).toEqual([
+      { id: -4, name: 'Traffic In', lastValue: '12,345 kbit/s', lastValueRaw: 1543125, volume: '1,234 MByte', volumeRaw: 1293942784 },
+      // No per-second unit on either value: PRTG's order, volume first, then speed.
+      { id: -1, name: 'Traffic Total', lastValue: '2,468 MByte', lastValueRaw: 2587885568, volume: '98 %', volumeRaw: 98 },
+      { id: 0, name: 'Downtime' },
+    ]);
+  });
+  it('parseJsonKeepingRepeats keeps every value of a repeated key, in order', () => {
+    const v = parseJsonKeepingRepeats('{"a":1,"b":{"x":"p","x":"q","x":"r"},"a":[true,null,-2.5e3],"s":"tab\there \\"q\\" \\u00e9"}') as any;
+    expect(v.a).toBeInstanceOf(Repeated);
+    expect([...v.a]).toEqual([1, [true, null, -2500]]);
+    expect([...v.b.x]).toEqual(['p', 'q', 'r']);
+    expect(v.s).toBe('tab here "q" é');
+    expect(parseJsonKeepingRepeats('{"rows":[],"o":{}}')).toEqual({ rows: [], o: {} });
+    expect(() => parseJsonKeepingRepeats('{"a":1')).toThrow(SyntaxError);
+    expect(() => parseJsonKeepingRepeats('{"a":1} x')).toThrow(/trailing/);
+    expect(() => parseJsonKeepingRepeats('{"a":"open')).toThrow(/unterminated/);
   });
   it('prtg_get_sensor says when there is no such sensor', async () => {
     const { fn } = fakePrtg({ 'getsensordetails.json': json({ sensordata: {} }), 'table.json:channels': table('channels', []) });

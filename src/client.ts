@@ -168,6 +168,105 @@ export function parsePrtgJson(text: string): unknown {
   }
 }
 
+/** The values of a key that appears more than once in one JSON object, in document order. */
+export class Repeated extends Array<unknown> {}
+
+/**
+ * JSON.parse that keeps repeated keys. PRTG's table.json with the `lastvalue_` column gives a
+ * traffic channel its volume and its speed under the same key, twice ("lastvalue": "...",
+ * "lastvalue_raw": ..., "lastvalue": "...", "lastvalue_raw": ...); JSON.parse would keep only
+ * the last. Here a repeated key's value becomes a `Repeated` array of every value in order.
+ * Raw control characters inside strings are read as spaces, as parsePrtgJson does.
+ */
+export function parseJsonKeepingRepeats(text: string): unknown {
+  let i = 0;
+  const ws = () => {
+    while (i < text.length && /\s/.test(text[i])) i++;
+  };
+  const fail = (what: string): never => {
+    throw new SyntaxError(`${what} at position ${i}`);
+  };
+  const str = (): string => {
+    const start = i;
+    i++; // opening quote
+    while (i < text.length && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+    if (i >= text.length) fail('unterminated string');
+    i++;
+    // eslint-disable-next-line no-control-regex
+    return JSON.parse(text.slice(start, i).replace(/[\u0000-\u001f]/g, ' ')) as string;
+  };
+  const value = (): unknown => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i++;
+      const obj: Record<string, unknown> = {};
+      ws();
+      if (text[i] === '}') {
+        i++;
+        return obj;
+      }
+      for (;;) {
+        ws();
+        if (text[i] !== '"') fail('expected a key');
+        const key = str();
+        ws();
+        if (text[i] !== ':') fail('expected :');
+        i++;
+        const v = value();
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+          const prev = obj[key];
+          if (prev instanceof Repeated) prev.push(v);
+          else obj[key] = Repeated.from([prev, v]) as Repeated;
+        } else {
+          obj[key] = v;
+        }
+        ws();
+        if (text[i] === ',') {
+          i++;
+          continue;
+        }
+        if (text[i] === '}') {
+          i++;
+          return obj;
+        }
+        fail('expected , or }');
+      }
+    }
+    if (c === '[') {
+      i++;
+      const arr: unknown[] = [];
+      ws();
+      if (text[i] === ']') {
+        i++;
+        return arr;
+      }
+      for (;;) {
+        arr.push(value());
+        ws();
+        if (text[i] === ',') {
+          i++;
+          continue;
+        }
+        if (text[i] === ']') {
+          i++;
+          return arr;
+        }
+        fail('expected , or ]');
+      }
+    }
+    if (c === '"') return str();
+    const m = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/.exec(text.slice(i, i + 64));
+    if (!m) fail('unexpected character');
+    i += m![0].length;
+    return JSON.parse(m![0]);
+  };
+  const out = value();
+  ws();
+  if (i < text.length) fail('trailing characters');
+  return out;
+}
+
 /**
  * One GET to the classic API; returns the parsed JSON object. Retried once
  * after a short 429. Errors carry the endpoint, status and PRTG's message,
@@ -177,7 +276,8 @@ export async function request<T = Record<string, unknown>>(
   config: PrtgConfig,
   endpoint: string,
   params: Params = [],
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  keepRepeats = false
 ): Promise<T> {
   const url = buildUrl(config, endpoint, params);
   const label = `GET /api/${endpoint}`;
@@ -224,7 +324,7 @@ export async function request<T = Record<string, unknown>>(
   }
   let parsed: unknown;
   try {
-    parsed = parsePrtgJson(text);
+    parsed = keepRepeats ? parseJsonKeepingRepeats(text) : parsePrtgJson(text);
   } catch {
     throw new PrtgApiError(`PRTG ${label}: the response is not JSON.${NOT_JSON_HINT}`, res.status);
   }
@@ -255,6 +355,8 @@ export interface TableQuery {
   id?: number;
   /** Extra filter_*, sortby and similar parameters. */
   params?: Params;
+  /** Keep repeated keys in each row (see parseJsonKeepingRepeats), for the `lastvalue_` column. */
+  keepRepeats?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -281,7 +383,7 @@ export function makeApi(config: PrtgConfig): Api {
         ...(q.id !== undefined ? ([['id', q.id]] as Params) : []),
         ...(q.params ?? []),
       ];
-      const body = await request<PrtgTable>(config, 'table.json', params);
+      const body = await request<PrtgTable>(config, 'table.json', params, undefined, q.keepRepeats);
       const rows = body[content];
       const items = (Array.isArray(rows) ? rows : []) as T[];
       const total = typeof body.treesize === 'number' ? body.treesize : offset + items.length;

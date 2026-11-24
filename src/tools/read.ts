@@ -1,6 +1,8 @@
 import type { Api, Params } from '../client.js';
 import {
   ALARM_ORDER,
+  CHANNEL_COLUMNS,
+  channelRow,
   DEVICE_COLUMNS,
   GROUP_COLUMNS,
   PROBE_COLUMNS,
@@ -143,7 +145,7 @@ async function getSensor(args: Record<string, unknown>, api: Api) {
   const id = args.sensor_id as number;
   const [details, channels] = await Promise.all([
     api.get('getsensordetails.json', [['id', id]]),
-    api.table('channels', { columns: ['objid', 'name', 'lastvalue'], id, limit: 200 }),
+    api.table('channels', { columns: CHANNEL_COLUMNS, id, limit: 200, keepRepeats: true }),
   ]);
   const d = (details.sensordata ?? {}) as Record<string, unknown>;
   if (!clean(d.name)) throw new InputError(`PRTG has no sensor ${id} that this token can read`);
@@ -168,14 +170,7 @@ async function getSensor(args: Record<string, unknown>, api: Api) {
     downtime: clean(d.downtime, 40),
     downtimeFor: clean(d.downtimetime, 80),
     statsSince: clean(d.updownsince, 80),
-    channels: channels.items.map((c) =>
-      compact({
-        id: num(c.objid_raw) ?? num(c.objid),
-        name: clean(c.name, 120),
-        lastValue: clean(c.lastvalue, 100),
-        lastValueRaw: num(c.lastvalue_raw),
-      })
-    ),
+    channels: channels.items.map(channelRow),
   });
 }
 

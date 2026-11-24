@@ -1,3 +1,4 @@
+import { Repeated } from '../client.js';
 import type { Page, Params } from '../client.js';
 import { InputError, clean, compact, num } from './shared.js';
 
@@ -161,6 +162,36 @@ export function probeRow(r: Record<string, unknown>): Record<string, unknown> {
     connection: clean(r.condition, 60),
     message: message(r, 200),
     sensors: sensorCounts(r),
+  });
+}
+
+/** Columns for a sensor's channels: `lastvalue_` gives traffic channels both volume and speed. */
+export const CHANNEL_COLUMNS = ['objid', 'name', 'lastvalue_'] as const;
+
+const asList = (v: unknown): unknown[] => (v instanceof Repeated ? [...v] : v === undefined ? [] : [v]);
+
+/**
+ * A channel's last value. With `lastvalue_`, PRTG gives a traffic channel two values under the
+ * same key (the JSON repeats "lastvalue" and "lastvalue_raw"; read with parseJsonKeepingRepeats):
+ * the volume and the speed. The speed is the one whose unit is per second ("kbit/s", "#/s");
+ * if neither says, PRTG's order is volume first, then speed. Other channels have one value.
+ * Some versions name the keys after the column ("lastvalue_", "lastvalue__raw"); both are read.
+ */
+export function channelRow(r: Record<string, unknown>): Record<string, unknown> {
+  const texts = [...asList(r.lastvalue), ...asList(r.lastvalue_)].map((t) => clean(t, 100));
+  const raws = [...asList(r.lastvalue_raw), ...asList(r.lastvalue__raw)].map((v) => num(v));
+  const base = { id: num(r.objid_raw) ?? num(r.objid), name: clean(r.name, 120) };
+  if (texts.length < 2) return compact({ ...base, lastValue: texts[0], lastValueRaw: raws[0] });
+  const perSecond = (t: string | undefined) => /\/\s*s(ec)?\b/i.test(t ?? '');
+  let speed = texts.findIndex(perSecond);
+  if (speed < 0 || texts.every(perSecond)) speed = 1;
+  const volume = speed === 0 ? 1 : 0;
+  return compact({
+    ...base,
+    lastValue: texts[speed],
+    lastValueRaw: raws[speed],
+    volume: texts[volume],
+    volumeRaw: raws[volume],
   });
 }
 

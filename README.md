@@ -11,7 +11,9 @@ PRTG has two HTTP APIs:
 - the **classic API** (`/api/table.json` and friends), served by the PRTG web interface on every on-premises version;
 - **API v2** (PRTG 25+), served by a separate Application Server (port 1616) that has to be activated, and that is not available on PRTG Hosted Monitor or in cluster mode.
 
-This server uses the classic API, so it works on any on-premises PRTG from 22.1 (when API keys arrived). [WYRE-AI/prtg-mcp](https://github.com/WYRE-AI/prtg-mcp) covers API v2.
+This server uses the classic API, so it works on any on-premises PRTG from 22.1 (when API keys arrived), including 25.x whether or not API v2 is activated. [WYRE-AI/prtg-mcp](https://github.com/WYRE-AI/prtg-mcp) covers API v2.
+
+**Adding API v2 later:** every PRTG request goes through `src/client.ts` (`Api.get` and `Api.table`, over a fixed list of endpoints), and the tools only see the `Api` interface plus the row mappers in `src/tools/format.ts`. A v2 backend would be a second `Api` implementation, chosen by a setting such as `PRTG_API=v2` with its own base URL (the Application Server, port 1616), that maps v2 objects onto the same rows. The tools and their output would not change.
 
 ## The API
 

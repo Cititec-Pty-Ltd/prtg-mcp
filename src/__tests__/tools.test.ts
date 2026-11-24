@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, Repeated, buildUrl, parseJsonKeepingRepeats, parsePrtgJson, parsePrtgUrl, parseTimeZone, scrub, setFetchForTests } from '../client.js';
 import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
-import { chooseAverage, parseLocal, prtgTime, resolveRange, rowValues, sample } from '../tools/history.js';
+import { chooseAverage, parseLocal, prtgTime, resolveRange, rowValues, sameScale, sample, shownNumbers, unitOf } from '../tools/history.js';
 import { clean, wrapUntrusted } from '../tools/shared.js';
 import { dataOf, fakePrtg, json, table, textOf } from './test-helpers.js';
 
@@ -449,6 +449,47 @@ describe('historic data', () => {
       { channel: 'Traffic In', value: 1500, text: '1,5 kbit/s' },
     ]);
     expect(rowValues({ Downtime: '', Downtime_raw: '' })).toEqual([{ channel: 'Downtime', value: undefined, text: undefined }]);
+  });
+  it('reads formatted numbers in either locale and checks their scale', () => {
+    expect(unitOf('1,5 kbit/s')).toBe('kbit/s');
+    expect(unitOf('12 msec')).toBe('msec');
+    expect(unitOf('42')).toBeUndefined();
+    expect(shownNumbers('1,5 kbit/s')).toEqual(expect.arrayContaining([1.5, 15]));
+    expect(shownNumbers('1.234,5 MByte')).toContain(1234.5);
+    expect(shownNumbers('1,234 MByte')).toEqual(expect.arrayContaining([1234, 1.234]));
+    expect(sameScale('1,5 kbit/s', 1500)).toBe(false);
+    expect(sameScale('1,5 kbit/s', 1.5)).toBe(true);
+    expect(sameScale('12 msec', 12.4)).toBe(true);
+    expect(sameScale('1,234 MByte', 1293942784)).toBe(false);
+    expect(sameScale('< 1 msec', 0.2)).toBe(false);
+  });
+  it('a unit is never put on raw values of another scale', async () => {
+    const rows = [1500, 2500, 500].map((raw, i) => ({
+      datetime: `t${i}`,
+      value: [{ channel: 'Traffic In', value: `${String(raw / 1000).replace('.', ',')} kbit/s`, value_raw: raw }],
+    }));
+    const { fn } = fakePrtg({ 'historicdata.json': json({ histdata: rows }) });
+    setFetchForTests(fn);
+    const d = dataOf(await call('prtg_get_sensor_history', { sensor_id: 7, hours: 1 }));
+    expect(d.channels['Traffic In']).toEqual({
+      rawScale: 'PRTG raw values, not in the displayed unit: 1500 was shown as "1,5 kbit/s"',
+      min: 500,
+      max: 2500,
+      mean: 1500,
+      last: 500,
+      samples: 3,
+    });
+  });
+  it('no unit when PRTG switches units between intervals', async () => {
+    const rows = [
+      { datetime: 't0', Volume: '900 MByte', Volume_raw: 900 },
+      { datetime: 't1', Volume: '1 GByte', Volume_raw: 1 },
+    ];
+    const { fn } = fakePrtg({ 'historicdata.json': json({ histdata: rows }) });
+    setFetchForTests(fn);
+    const d = dataOf(await call('prtg_get_sensor_history', { sensor_id: 7, hours: 1 }));
+    expect(d.channels.Volume.unit).toBeUndefined();
+    expect(d.channels.Volume.rawScale).toMatch(/1 was shown as "1 GByte"/);
   });
   it('samples evenly, keeping first and last', () => {
     expect(sample([1, 2, 3, 4, 5, 6, 7, 8, 9], 3)).toEqual([1, 5, 9]);

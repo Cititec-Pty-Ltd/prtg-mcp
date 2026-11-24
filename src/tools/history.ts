@@ -127,12 +127,44 @@ function leadingNumber(v: unknown): number | undefined {
 }
 
 interface Summary {
-  unit?: string;
   min?: number;
   max?: number;
   mean?: number;
   last?: number;
   samples: number;
+  /** The unit of the formatted text, while every formatted value matches its raw value's scale. */
+  unit?: string;
+  /** false once a formatted value is in another scale or unit than the raw numbers. */
+  unitOk: boolean;
+  /** A raw value and how PRTG showed it, kept when the scales differ. */
+  example?: { raw: number; shown: string };
+}
+
+/** The unit part of PRTG's formatted value ("1,5 kbit/s" -> "kbit/s"), or undefined. */
+export function unitOf(text: string): string | undefined {
+  const unit = text.replace(/^\s*-?[\d.,\s]+/, '').trim();
+  return unit && unit.length <= 20 ? unit : undefined;
+}
+
+/**
+ * The numbers a formatted value could mean: PRTG formats with the server's locale, so "1,234"
+ * may be 1.234 or 1234, and "1.234,5" is 1234.5.
+ */
+export function shownNumbers(text: string): number[] {
+  const m = /^\s*(-?[\d][\d.,\s]*)/.exec(text);
+  if (!m) return [];
+  const s = m[1].replace(/\s+/g, '').replace(/[.,]$/, '');
+  const candidates = [
+    s.replace(/,/g, ''), // comma thousands
+    s.replace(/\./g, '').replace(',', '.'), // dot thousands, comma decimal
+    s.replace(',', '.'), // comma decimal
+  ];
+  return [...new Set(candidates.map(Number).filter((n) => Number.isFinite(n)))];
+}
+
+/** Whether a formatted value shows the raw number at the same scale (allowing for rounding). */
+export function sameScale(text: string, raw: number): boolean {
+  return shownNumbers(text).some((n) => Math.abs(n - raw) <= Math.max(0.02 * Math.abs(raw), 0.51));
 }
 
 /** Evenly spaced picks from `rows`, always keeping the first and the last. */
@@ -167,15 +199,23 @@ export async function sensorHistory(args: HistoryArgs, api: Api, now = Date.now(
     for (const v of values) {
       entry[v.channel] = v.value ?? v.text ?? null;
       if (v.value === undefined) continue;
-      const s = sums.get(v.channel) ?? { samples: 0, total: 0 };
+      const s = sums.get(v.channel) ?? { samples: 0, total: 0, unitOk: true };
       s.min = s.min === undefined ? v.value : Math.min(s.min, v.value);
       s.max = s.max === undefined ? v.value : Math.max(s.max, v.value);
       s.total += v.value;
       s.samples += 1;
       s.last = v.value;
-      if (!s.unit && v.text) {
-        const unit = v.text.replace(/^\s*-?[\d.,\s]+/, '').trim();
-        if (unit && unit.length <= 20) s.unit = unit;
+      // A unit is given only while every formatted value shows the raw number in that unit:
+      // raw values can be in another scale (1500 shown as "1,5 kbit/s"), and PRTG may switch
+      // units between intervals (MByte, GByte).
+      if (v.text && s.unitOk) {
+        const unit = unitOf(v.text);
+        if (!sameScale(v.text, v.value) || (unit && s.unit && unit !== s.unit)) {
+          s.unitOk = false;
+          s.example = { raw: v.value, shown: v.text };
+        } else if (unit) {
+          s.unit ??= unit;
+        }
       }
       sums.set(v.channel, s);
     }
@@ -184,7 +224,10 @@ export async function sensorHistory(args: HistoryArgs, api: Api, now = Date.now(
   const channels: Record<string, unknown> = {};
   for (const [name, s] of sums) {
     channels[name] = compact({
-      unit: s.unit,
+      unit: s.unitOk ? s.unit : undefined,
+      rawScale: s.unitOk
+        ? undefined
+        : `PRTG raw values, not in the displayed unit: ${s.example!.raw} was shown as "${s.example!.shown}"`,
       min: s.min,
       max: s.max,
       mean: s.samples ? Math.round((s.total / s.samples) * 1000) / 1000 : undefined,

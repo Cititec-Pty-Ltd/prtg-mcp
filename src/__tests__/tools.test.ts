@@ -165,6 +165,43 @@ describe('untrusted text', () => {
     expect(d.sensors.warning).toBe(0);
     expect(d.tokenUser).toEqual({ readOnly: true, administrator: false });
   });
+  it('prtg_status reads the lower-case fields /api/status.json actually returns', async () => {
+    const { fn } = fakePrtg({
+      'status.json': json({
+        prtgversion: '25.1.104.1961',
+        version: '25.1.104.1961+',
+        clock: '24/11/2026 11:00:00 AM',
+        newmessages: '5',
+        newalarms: '1',
+        alarms: '3',
+        partialalarms: '1',
+        ackalarms: '2',
+        warnsens: '4',
+        unusualsens: '',
+        pausedsens: '7',
+        upsens: '412',
+        unknownsens: '',
+        readonlyuser: 'true',
+        isadminuser: 'false',
+        prtgupdateavailable: 'false',
+        maintexpirydays: '120',
+        iscluster: 'false',
+      }),
+    });
+    setFetchForTests(fn);
+    const d = dataOf(await call('prtg_status'));
+    expect(d).toEqual({
+      version: '25.1.104.1961+',
+      serverClock: '24/11/2026 11:00:00 AM',
+      sensors: { down: 3, downPartial: 1, downAcknowledged: 2, warning: 4, unusual: 0, paused: 7, up: 412, unknown: 0 },
+      newAlarms: 1,
+      newLogEntries: 5,
+      tokenUser: { readOnly: true, administrator: false },
+      updateAvailable: false,
+      maintenanceExpiresInDays: 120,
+      cluster: false,
+    });
+  });
   it('PRTG_UNTRUSTED_MARKERS=off turns wrapping off', async () => {
     process.env.PRTG_UNTRUSTED_MARKERS = 'off';
     const { fn } = fakePrtg({ 'table.json:probenodes': table('probenodes', [{ objid: 1, name: 'Local Probe', status_raw: 3 }]) });
@@ -216,30 +253,63 @@ describe('lists', () => {
     expect(calls[0].searchParams.get('filter_parentid')).toBe('0');
     expect(d.items[0]).toEqual({ id: 1, name: 'Local Probe', state: 'up', status: 'Up', connection: 'Connected', sensors: { total: 120, down: 2 } });
   });
-  it('prtg_list_alarms asks for alarm states, worst first, with whole-server counts', async () => {
+  /**
+   * A fake sensors table per status code that honours start and count, like PRTG: rows are in
+   * object-ID order and treesize is the state's total.
+   */
+  function alarmTables(byCode: Record<number, { objid: number; name: string }[]>) {
+    return (u: URL) => {
+      const code = Number(u.searchParams.get('filter_status'));
+      const rows = (byCode[code] ?? []).map((r) => ({ ...r, status_raw: code }));
+      const start = Number(u.searchParams.get('start'));
+      const count = Number(u.searchParams.get('count'));
+      return table('sensors', rows.slice(start, start + count), rows.length);
+    };
+  }
+  const tableCalls = (calls: URL[]) => calls.filter((u) => u.pathname.endsWith('table.json'));
+
+  it('prtg_list_alarms reads each state worst first, so down sensors come before low-ID warnings', async () => {
     const { fn, calls } = fakePrtg({
-      'table.json:sensors': table('sensors', [
-        { objid: 1, name: 'Disk', status_raw: 4 },
-        { objid: 2, name: 'Ping', status_raw: 5, downtimesince: '3 h 4 m' },
-        { objid: 3, name: 'HTTP', status_raw: 13 },
-      ]),
-      'status.json': json({ Alarms: '1', AckAlarms: '1', WarnSens: '1' }),
+      'table.json:sensors': alarmTables({
+        4: [{ objid: 1, name: 'Disk' }, { objid: 2, name: 'CPU' }],
+        5: [{ objid: 900, name: 'Ping' }],
+        13: [{ objid: 50, name: 'HTTP' }],
+      }),
+      'status.json': json({ alarms: '1', ackalarms: '1', warnsens: '2' }),
     });
     setFetchForTests(fn);
-    const d = dataOf(await call('prtg_list_alarms'));
-    const t = calls.find((u) => u.pathname.endsWith('table.json'))!;
-    expect(t.searchParams.getAll('filter_status')).toEqual(['5', '14', '13', '4', '10']);
-    expect(d.items.map((i: any) => i.id)).toEqual([2, 3, 1]);
-    expect(d.items[0].downFor).toBe('3 h 4 m');
-    expect(d.wholeServer.down).toBe(1);
+    const d = dataOf(await call('prtg_list_alarms', { limit: 2 }));
+    expect(tableCalls(calls).map((u) => u.searchParams.getAll('filter_status'))).toEqual([['5'], ['14'], ['13'], ['4'], ['10']]);
+    expect(d.items.map((i: any) => i.id)).toEqual([900, 50]);
+    expect(d).toMatchObject({ total: 4, offset: 0, count: 2, nextOffset: 2 });
+    expect(d.wholeServer).toMatchObject({ down: 1, downAcknowledged: 1, warning: 2 });
   });
-  it('prtg_list_alarms below a parent skips the server counts and can drop warnings', async () => {
-    const { fn, calls } = fakePrtg({ 'table.json:sensors': table('sensors', []) });
+  it('prtg_list_alarms pages across states: the offset carries from one state into the next', async () => {
+    const down = [1, 2, 3].map((i) => ({ objid: 100 + i, name: `down${i}` }));
+    const warn = [1, 2, 3, 4, 5].map((i) => ({ objid: i, name: `warn${i}` }));
+    const { fn, calls } = fakePrtg({ 'table.json:sensors': alarmTables({ 5: down, 4: warn }), 'status.json': json({}) });
+    setFetchForTests(fn);
+    const d = dataOf(await call('prtg_list_alarms', { limit: 4, offset: 2 }));
+    expect(d.items.map((i: any) => i.name)).toEqual(['down3', 'warn1', 'warn2', 'warn3']);
+    expect(d).toMatchObject({ total: 8, offset: 2, count: 4, nextOffset: 6 });
+    const t = tableCalls(calls);
+    expect(t[0].searchParams.get('start')).toBe('2'); // down: skip 2 of 3
+    expect(t[3].searchParams.get('start')).toBe('0'); // warning: from its first row
+    expect(t[3].searchParams.get('count')).toBe('3');
+    expect(t[4].searchParams.get('count')).toBe('1'); // unusual: only counted
+    // The last page
+    const last = dataOf(await call('prtg_list_alarms', { limit: 4, offset: 6 }));
+    expect(last.items.map((i: any) => i.name)).toEqual(['warn4', 'warn5']);
+    expect(last.nextOffset).toBeUndefined();
+  });
+  it('prtg_list_alarms below a parent skips the server counts and can drop states', async () => {
+    const { fn, calls } = fakePrtg({ 'table.json:sensors': alarmTables({}) });
     setFetchForTests(fn);
     const d = dataOf(await call('prtg_list_alarms', { parent_id: 2040, include_warnings: false, include_unusual: false, include_acknowledged: false }));
-    expect(calls).toHaveLength(1);
-    expect(calls[0].searchParams.getAll('filter_status')).toEqual(['5', '14']);
+    expect(calls.map((u) => u.searchParams.getAll('filter_status'))).toEqual([['5'], ['14']]);
+    expect(calls.every((u) => u.searchParams.get('id') === '2040')).toBe(true);
     expect(d.wholeServer).toBeUndefined();
+    expect(d.total).toBe(0);
   });
   it('prtg_list_logs uses the period and object', async () => {
     const { fn, calls } = fakePrtg({

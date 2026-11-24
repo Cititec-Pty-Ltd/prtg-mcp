@@ -52,13 +52,28 @@ const int = (v: unknown) => v as number | undefined;
 
 // --- Status ---------------------------------------------------------------------------------
 
+/**
+ * status.json answers with lower-case field names (alarms, upsens, version); getstatus.htm and
+ * some versions use PascalCase (Alarms, UpSens, Version). Fields are read ignoring case, so both work.
+ */
+export function statusFields(raw: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(raw)) out[k.toLowerCase()] = v;
+  return out;
+}
+
 async function status(api: Api) {
-  const s = await api.get('status.json');
-  const n = (k: string) => num(s[k]) ?? 0;
-  const yes = (k: string) => (typeof s[k] === 'boolean' ? s[k] : /^(true|1|yes)$/i.test(String(s[k] ?? '')));
+  const s = statusFields(await api.get('status.json'));
+  const pick = (k: string) => s[k.toLowerCase()];
+  const n = (k: string) => num(pick(k)) ?? 0;
+  const has = (k: string) => pick(k) !== undefined;
+  const yes = (k: string) => {
+    const v = pick(k);
+    return typeof v === 'boolean' ? v : /^(true|1|yes)$/i.test(String(v ?? ''));
+  };
   return compact({
-    version: clean(s.Version, 60),
-    serverClock: clean(s.Clock, 60),
+    version: clean(pick('Version'), 60),
+    serverClock: clean(pick('Clock'), 60),
     sensors: {
       down: n('Alarms'),
       downPartial: n('PartialAlarms'),
@@ -72,33 +87,54 @@ async function status(api: Api) {
     newAlarms: n('NewAlarms'),
     newLogEntries: n('NewMessages'),
     tokenUser: compact({
-      readOnly: s.ReadOnlyUser !== undefined ? yes('ReadOnlyUser') : undefined,
-      administrator: s.IsAdminUser !== undefined ? yes('IsAdminUser') : undefined,
+      readOnly: has('ReadOnlyUser') ? yes('ReadOnlyUser') : undefined,
+      administrator: has('IsAdminUser') ? yes('IsAdminUser') : undefined,
     }),
-    updateAvailable: s.PRTGUpdateAvailable !== undefined ? yes('PRTGUpdateAvailable') : undefined,
-    maintenanceExpiresInDays: num(s.MaintExpiryDays),
-    cluster: s.IsCluster !== undefined ? yes('IsCluster') : undefined,
+    updateAvailable: has('PRTGUpdateAvailable') ? yes('PRTGUpdateAvailable') : undefined,
+    maintenanceExpiresInDays: num(pick('MaintExpiryDays')),
+    cluster: has('IsCluster') ? yes('IsCluster') : undefined,
   });
 }
 
 // --- Sensors and alarms -----------------------------------------------------------------------
 
-const ALARM_RANK = new Map(ALARM_ORDER.map((c, i) => [c, i]));
-
+/**
+ * Alarms worst first, paged over the whole set. PRTG pages a table by object ID, and sorting by
+ * status would not give severity order (warning 4 < down 5 < unusual 10 < acknowledged 13 <
+ * partial 14), so each state is read on its own, in ALARM_ORDER, and the caller's offset and
+ * limit are applied across them: one table read per state (a one-row read for a state only
+ * counted). The total is the sum of the states' totals.
+ */
 async function listAlarms(args: Record<string, unknown>, api: Api) {
-  const codes = [5, 14];
-  if (args.include_acknowledged) codes.push(13);
-  if (args.include_warnings) codes.push(4);
-  if (args.include_unusual) codes.push(10);
-  const params: Params = [...codes.map((c) => ['filter_status', c] as [string, number]), ...subFilter('name', str(args.name), 'name')];
-  const [page, counts] = await Promise.all([
-    api.table('sensors', { columns: SENSOR_COLUMNS, id: int(args.parent_id), params, limit: int(args.limit), offset: int(args.offset) }),
-    int(args.parent_id) === undefined ? status(api).then((s) => s.sensors).catch(() => undefined) : Promise.resolve(undefined),
-  ]);
-  page.items.sort(
-    (a, b) => (ALARM_RANK.get(num(a.status_raw) ?? 0) ?? 99) - (ALARM_RANK.get(num(b.status_raw) ?? 0) ?? 99)
-  );
-  return compact({ wholeServer: counts, ...paged(page, sensorRow) });
+  const include = new Set([5, 14]);
+  if (args.include_acknowledged) include.add(13);
+  if (args.include_warnings) include.add(4);
+  if (args.include_unusual) include.add(10);
+  const codes = ALARM_ORDER.filter((c) => include.has(c));
+  const limit = int(args.limit) ?? 100;
+  const offset = int(args.offset) ?? 0;
+  const id = int(args.parent_id);
+  const name = subFilter('name', str(args.name), 'name');
+
+  const countsP = id === undefined ? status(api).then((s) => s.sensors).catch(() => undefined) : Promise.resolve(undefined);
+  const items: Record<string, unknown>[] = [];
+  let before = 0; // alarms in the states already read
+  for (const code of codes) {
+    const need = limit - items.length;
+    const start = Math.max(0, offset - before);
+    const params: Params = [['filter_status', code], ...name];
+    const p = await api.table('sensors', {
+      columns: SENSOR_COLUMNS,
+      id,
+      params,
+      limit: need > 0 ? need : 1,
+      offset: need > 0 ? start : 0,
+    });
+    if (need > 0) items.push(...p.items.slice(0, need));
+    before += p.total;
+  }
+  const counts = await countsP;
+  return compact({ wholeServer: counts, ...paged({ total: before, offset, items }, sensorRow) });
 }
 
 // --- Sensor details ---------------------------------------------------------------------------
